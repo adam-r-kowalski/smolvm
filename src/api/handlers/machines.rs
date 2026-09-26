@@ -1621,6 +1621,10 @@ pub async fn restore_portable_checkpoint(
     // The cache take verified this request's pinned artifact; hand that
     // verification over so creation does not read the payload a second time.
     // It only applies if the path creation uses still names that exact inode.
+    // Creation now survives a disconnected caller. Keep uploaded/prepared
+    // inputs alive through that owned operation and its cache publication too.
+    with_owned_operation(move |reply| async move {
+        let _transfer = _transfer;
     let result = create_machine_inner(State(state), Json(request), verified, cache_hit).await;
     #[cfg(target_os = "linux")]
     drop(prepared);
@@ -1633,7 +1637,8 @@ pub async fn restore_portable_checkpoint(
             }
         }
     }
-    result
+    let _ = reply.send(result);
+    }).await
 }
 
 /// Build a MachineEntry from a VmRecord and AgentManager.

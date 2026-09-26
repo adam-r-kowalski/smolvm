@@ -4687,65 +4687,81 @@ async fn delete_one_transaction(
     let _source_lock = acquire_fork_source_lock(name.clone()).await?;
 
     // Check if VM exists and get its state (off the reactor)
-    let record =
-        match state.lookup_vm(&name).await? {
-            Some(record) => record,
-            None => {
-                let db = state.db().clone();
-                let pending_name = name.clone();
-                tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
-                    let outcome = db
-                        .reclaim_pending_vm_create(&pending_name, || {
-                            let dir = vm_data_dir(&pending_name);
-                            if dir.exists() {
-                                let actual =
-                                    std::fs::read_to_string(dir.join("name")).map_err(|e| {
+    let record = match state.lookup_vm(&name).await? {
+        Some(record) => record,
+        None => {
+            let db = state.db().clone();
+            let pending_name = name.clone();
+            tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+                let outcome = db
+                    .reclaim_pending_vm_create(&pending_name, || {
+                        let dir = vm_data_dir(&pending_name);
+                        if dir.exists() {
+                            let actual = match std::fs::read_to_string(dir.join("name")) {
+                                Ok(actual) => actual,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    // Preparation can stop between mkdir and the name binding.
+                                    // The DB reservation is fenced here. Remove ONLY an empty
+                                    // directory: unknown contents or a concurrent binding must
+                                    // preserve ownership for inspection/retry, not be erased.
+                                    std::fs::remove_dir(&dir).map_err(|error| {
                                         crate::error::Error::Storage {
-                                            operation: "verify pending owner".into(),
-                                            reason: e.to_string(),
+                                            operation: "remove unbound pending directory".into(),
+                                            reason: error.to_string(),
                                         }
                                     })?;
-                                if actual.trim() != pending_name {
+                                    return Ok(());
+                                }
+                                Err(error) => {
                                     return Err(crate::error::Error::Storage {
                                         operation: "verify pending owner".into(),
-                                        reason: "directory ownership mismatch".into(),
-                                    });
+                                        reason: error.to_string(),
+                                    })
                                 }
-                                smolvm_pack::extract::force_detach_layers_volume(
-                                    &crate::agent::machine_layers_cache_dir(&pending_name),
-                                );
-                                std::fs::remove_dir_all(dir).map_err(|e| {
-                                    crate::error::Error::Storage {
-                                        operation: "remove pending storage".into(),
-                                        reason: e.to_string(),
-                                    }
-                                })?;
+                            };
+                            if actual.trim() != pending_name {
+                                return Err(crate::error::Error::Storage {
+                                    operation: "verify pending owner".into(),
+                                    reason: "directory ownership mismatch".into(),
+                                });
                             }
-                            Ok(())
-                        })
-                        .map_err(ApiError::database)?;
-                    match outcome {
-                        crate::db::PendingCreateReclaim::Absent => {
-                            return Err(ApiError::NotFound(format!(
-                                "machine '{}' not found",
-                                pending_name
-                            )))
+                            smolvm_pack::extract::force_detach_layers_volume(
+                                &crate::agent::machine_layers_cache_dir(&pending_name),
+                            );
+                            std::fs::remove_dir_all(dir).map_err(|e| {
+                                crate::error::Error::Storage {
+                                    operation: "remove pending storage".into(),
+                                    reason: e.to_string(),
+                                }
+                            })?;
                         }
-                        crate::db::PendingCreateReclaim::Active => return Err(ApiError::Conflict(
+                        Ok(())
+                    })
+                    .map_err(ApiError::database)?;
+                match outcome {
+                    crate::db::PendingCreateReclaim::Absent => {
+                        return Err(ApiError::NotFound(format!(
+                            "machine '{}' not found",
+                            pending_name
+                        )))
+                    }
+                    crate::db::PendingCreateReclaim::Active => {
+                        return Err(ApiError::Conflict(
                             "machine was published or creation is active in another process; retry"
                                 .into(),
-                        )),
-                        crate::db::PendingCreateReclaim::Reclaimed => {}
+                        ))
                     }
-                    Ok(())
-                })
-                .await
-                .map_err(|e| ApiError::internal(e.to_string()))??;
-                // Clears an in-process failed preparation's reservation as well.
-                state.release_machine_reservation(&name, "already-cleared");
-                return Ok(DeleteResponse { deleted: name });
-            }
-        };
+                    crate::db::PendingCreateReclaim::Reclaimed => {}
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))??;
+            // Clears an in-process failed preparation's reservation as well.
+            state.release_machine_reservation(&name, "already-cleared");
+            return Ok(DeleteResponse { deleted: name });
+        }
+    };
 
     // A forked clone's block disks are copy-on-write overlays backed by this
     // machine's disks, so deleting a golden with live clones would destroy
@@ -4869,9 +4885,11 @@ async fn delete_one_transaction(
         // doesn't leak the uid range. A fork clone has no uid of its own (it
         // shares its golden's). See process::free_vm_uid.
         crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);
-        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
-            tracing::warn!(error = %e, "failed to remove VM data directory: {}", data_dir.display());
-        }
+        // A failed removal may already have deleted some files. Keep the
+        // registered owner discoverable until every remaining file is gone;
+        // a later DELETE (including after restart) can safely retry.
+        std::fs::remove_dir_all(&data_dir)
+            .map_err(|error| ApiError::internal(format!("remove VM data directory: {error}")))?;
     }
 
     // Remove from registry (in-memory + database) in a blocking task: the DB

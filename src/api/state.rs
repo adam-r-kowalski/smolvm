@@ -226,8 +226,8 @@ pub struct MachineRegistration {
 
 /// RAII guard for machine name reservation.
 ///
-/// Automatically releases reservation on drop unless consumed by `complete()`.
-/// This ensures reservations are always cleaned up, even on panic.
+/// Releases an unused reservation on drop unless consumed by `complete()`.
+/// Once storage exists, retains durable ownership for explicit reconciliation.
 ///
 /// # Example
 ///
@@ -597,7 +597,8 @@ impl ApiState {
     /// serve` process (which owns this node's cache), never from a unit test or an
     /// embedded library user whose DB does not describe the host's dirs — there it
     /// would wipe live machines. The caller invokes it at server startup, before
-    /// requests are served, so it cannot race VM creation. Returns the count
+    /// requests are served; a database writer fence also excludes concurrent CLI
+    /// reservations and commits through the entire sweep. Returns the count
     /// removed.
     ///
     /// Safe by construction: only entries whose name is a VM data-dir hash (16
@@ -605,23 +606,21 @@ impl ApiState {
     /// pack store (`_shared`) and marker files are never touched, and every hash
     /// backing a live DB record is skipped.
     pub fn reclaim_dangling_vm_dirs(&self) -> usize {
-        let mut valid: std::collections::HashSet<String> = match self.db.list_vms() {
-            Ok(vms) => vms
-                .iter()
-                .map(|(name, _)| crate::agent::vm_dir_hash(name))
-                .collect(),
-            Err(_) => return 0,
-        };
-        // Pending creates are owned too. Preserve them for explicit deletion,
-        // including creations in a different live process sharing this database.
-        match self.db.pending_vm_creates() {
-            Ok(pending) => valid.extend(pending.iter().map(|(name, _, _)| crate::agent::vm_dir_hash(name))),
-            Err(_) => return 0,
-        }
-        let root = crate::agent::vm_cache_root();
-        let entries = match std::fs::read_dir(&root) {
+        self.reclaim_dangling_vm_dirs_at(&crate::agent::vm_cache_root(), || {})
+    }
+
+    fn reclaim_dangling_vm_dirs_at(
+        &self,
+        root: &std::path::Path,
+        after_snapshot: impl FnOnce(),
+    ) -> usize {
+        self.db.with_machine_inventory(|inventory| {
+        let valid: std::collections::HashSet<String> = inventory.machines.iter().map(|(name, _)| crate::agent::vm_dir_hash(name))
+            .chain(inventory.pending_creates.iter().map(|(name, _, _)| crate::agent::vm_dir_hash(name))).collect();
+        after_snapshot();
+        let entries = match std::fs::read_dir(root) {
             Ok(e) => e,
-            Err(_) => return 0,
+            Err(_) => return Ok(0),
         };
         let mut removed = 0;
         for entry in entries.flatten() {
@@ -639,7 +638,8 @@ impl ApiState {
                 }
             }
         }
-        removed
+        Ok(removed)
+        }).unwrap_or(0)
     }
 
     /// Get a machine entry by name.
@@ -2371,5 +2371,50 @@ mod tests {
             state.db.get_vm("alive-vm").unwrap().is_some(),
             "alive machine DB record should be preserved when reconnect fails"
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_sweep_tests {
+    use super::*;
+    #[test]
+    fn pending_sweep_fences_creators_starting_after_its_snapshot() {
+        use std::sync::mpsc;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let state = ApiState::with_db(SmolvmDb::open_at(&path).unwrap());
+        let creator = SmolvmDb::open_at(&path).unwrap();
+        let cache = root.path().join("vms");
+        std::fs::create_dir(&cache).unwrap();
+        let new_dir = cache.join(crate::agent::vm_dir_hash("late"));
+        let (start_tx, start_rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let directory = new_dir.clone();
+        let writer = std::thread::spawn(move || {
+            start_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            attempt_tx.send(()).unwrap();
+            assert!(creator.reserve_vm_create("late", "new").unwrap());
+            std::fs::create_dir_all(&directory).unwrap();
+            let record = crate::config::VmRecord::new("late".into(), 1, 512, vec![], vec![], false);
+            assert!(creator.commit_reserved_vm("late", "new", &record).unwrap());
+            done_tx.send(()).unwrap();
+        });
+        assert_eq!(
+            state.reclaim_dangling_vm_dirs_at(&cache, || {
+                start_tx.send(()).unwrap();
+                attempt_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                assert!(done_rx
+                    .recv_timeout(std::time::Duration::from_millis(30))
+                    .is_err());
+            }),
+            0
+        );
+        writer.join().unwrap();
+        assert!(new_dir.exists());
     }
 }

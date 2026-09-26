@@ -596,6 +596,15 @@ impl SmolvmDb {
         })
     }
 
+    /// Durable pending creates, including a creator interrupted before registration.
+    pub fn pending_vm_creates(&self) -> Result<Vec<(String, String, i64)>> {
+        self.with_read_conn(|conn| {
+            let mut statement = conn.prepare("SELECT name, owner_token, owner_pid FROM vm_create_reservations ORDER BY name").db_err("prepare pending creates")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).db_err("query pending creates")?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().db_err("read pending creates")
+        })
+    }
+
     /// Get a VM record by name.
     pub fn get_vm(&self, name: &str) -> Result<Option<VmRecord>> {
         self.with_read_conn(|conn| {

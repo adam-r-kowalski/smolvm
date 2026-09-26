@@ -1873,6 +1873,31 @@ async fn create_machine_inner(
     verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
     cached_checkpoint: bool,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    let name = req.name.clone().unwrap_or_else(generate_machine_name);
+    validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
+    let mut req = req;
+    req.name = Some(name.clone());
+    let guard = state.lifecycle_lock(&name).lock_owned().await;
+    with_owned_operation(move |reply| async move {
+        // Keep the guard and all preparation alive through client disconnect.
+        // DELETE cannot report absence while this create can still register.
+        let _guard = guard;
+        // Reserve before any image/network/disk preparation can be interrupted.
+        let result = match ReservationGuard::new(&state, name) {
+            Ok(reservation) => create_machine_transaction(State(state.clone()), Json(req), verified, cached_checkpoint, reservation).await,
+            Err(error) => Err(error),
+        };
+        let _ = reply.send(result);
+    }).await
+}
+
+async fn create_machine_transaction(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<CreateMachineRequest>,
+    verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
+    cached_checkpoint: bool,
+    guard: ReservationGuard<'_>,
+) -> Result<Json<MachineInfo>, ApiError> {
     #[cfg(target_os = "linux")]
     let mut req = req;
     #[cfg(target_os = "linux")]
@@ -2326,8 +2351,7 @@ async fn create_machine_inner(
     if manifest_checkpoint.is_some() {
         crate::portable_checkpoint::log_phase(&name, "api_restore_verify", &mut checkpoint_phase);
     }
-    // Reserve the name atomically (prevents concurrent creation)
-    let guard = ReservationGuard::new(&state, name.clone())?;
+    // The caller reserved this name before any asynchronous preparation.
 
     // Create manager (does not boot the VM)
     let mut manager = tokio::task::spawn_blocking({
@@ -2710,7 +2734,11 @@ pub async fn list_machines(
         .map(|(name, record)| record_to_info(name, record))
         .collect();
 
-    Ok(Json(ListMachinesResponse { machines }))
+    let db = state.db().clone();
+    let pending_creates = tokio::task::spawn_blocking(move || db.pending_vm_creates()).await
+        .map_err(|e| ApiError::internal(e.to_string()))?.map_err(ApiError::database)?
+        .into_iter().map(|(name, _, _)| name).collect();
+    Ok(Json(ListMachinesResponse { machines, pending_creates }))
 }
 
 /// Get machine status.
@@ -4582,10 +4610,37 @@ async fn delete_one_transaction(
     let _source_lock = acquire_fork_source_lock(name.clone()).await?;
 
     // Check if VM exists and get its state (off the reactor)
-    let record = state
-        .lookup_vm(&name)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    let record = match state.lookup_vm(&name).await? {
+        Some(record) => record,
+        None => {
+            let db = state.db().clone();
+            let pending_name = name.clone();
+            tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+                let pending = db.pending_vm_creates().map_err(ApiError::database)?;
+                let Some((_, token, pid)) = pending.into_iter().find(|(n, _, _)| n == &pending_name) else {
+                    return Err(ApiError::NotFound(format!("machine '{}' not found", pending_name)));
+                };
+                // Another process (e.g. CLI) has no access to this API lock.
+                if pid != i64::from(std::process::id()) && pid > 0 && is_alive(pid as crate::process::Pid) {
+                    return Err(ApiError::Conflict("machine creation is active in another process".into()));
+                }
+                let dir = vm_data_dir(&pending_name);
+                if dir.exists() {
+                    // Verify the hash binding before touching any partial storage.
+                    let actual = std::fs::read_to_string(dir.join("name")).map_err(|e| ApiError::internal(e.to_string()))?;
+                    if actual.trim() != pending_name { return Err(ApiError::Conflict("machine directory ownership mismatch".into())); }
+                    smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(&pending_name));
+                    std::fs::remove_dir_all(dir).map_err(|e| ApiError::internal(e.to_string()))?;
+                }
+                // Only forget ownership after deleting its task storage.
+                db.release_vm_create_reservation(&pending_name, &token).map_err(ApiError::database)?;
+                Ok(())
+            }).await.map_err(|e| ApiError::internal(e.to_string()))??;
+            // Clears an in-process failed preparation's reservation as well.
+            state.release_machine_reservation(&name, "already-cleared");
+            return Ok(DeleteResponse { deleted: name });
+        }
+    };
 
     // A forked clone's block disks are copy-on-write overlays backed by this
     // machine's disks, so deleting a golden with live clones would destroy

@@ -278,7 +278,9 @@ impl<'a> ReservationGuard<'a> {
 
 impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
-        if !self.completed {
+        // Keep ownership discoverable after an interrupted/failed preparation.
+        // DELETE holds the same lifecycle lock and can reclaim this reservation.
+        if !self.completed && !crate::agent::vm_data_dir(&self.name).exists() {
             self.state
                 .release_machine_reservation(&self.name, &self.token);
             tracing::debug!(machine = %self.name, "reservation guard released on drop");
@@ -603,13 +605,19 @@ impl ApiState {
     /// pack store (`_shared`) and marker files are never touched, and every hash
     /// backing a live DB record is skipped.
     pub fn reclaim_dangling_vm_dirs(&self) -> usize {
-        let valid: std::collections::HashSet<String> = match self.db.list_vms() {
+        let mut valid: std::collections::HashSet<String> = match self.db.list_vms() {
             Ok(vms) => vms
                 .iter()
                 .map(|(name, _)| crate::agent::vm_dir_hash(name))
                 .collect(),
             Err(_) => return 0,
         };
+        // Pending creates are owned too. Preserve them for explicit deletion,
+        // including creations in a different live process sharing this database.
+        match self.db.pending_vm_creates() {
+            Ok(pending) => valid.extend(pending.iter().map(|(name, _, _)| crate::agent::vm_dir_hash(name))),
+            Err(_) => return 0,
+        }
         let root = crate::agent::vm_cache_root();
         let entries = match std::fs::read_dir(&root) {
             Ok(e) => e,
